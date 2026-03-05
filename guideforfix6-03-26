@@ -638,3 +638,142 @@ Read the error message — it will tell you the line number
 Check your indentation carefully (Python is very sensitive to this)
 Make sure you didn't accidentally delete a line you weren't supposed to
 The fixes in order from most likely to cause a crash if wrong, to least: 1, 3, 4, 7, 5, 2, 6, everything else.
+
+
+
+
+Gravity Sim — Visual Rendering Bugs: Root Cause & Fixes
+The Short Answer
+Every single visual bug you described — stars not moving, trails running away, planets stuck near the sun — all come from one bug: the matrix multiplication order in _model_matrix. Everything else is a side effect of that one line.
+
+Why Your Symptoms All Connect
+Here's what's happening under the hood:
+
+Your simulation has two separate "worlds":
+
+Physics world — positions stored in real metres (e.g. Earth = 149 billion metres from Sun)
+GL world — positions scaled down to fit the screen (divided by SCALE = 2 AU)
+Every frame, three things use the body's position:
+
+
+
+Thing	How it gets position	Uses matrix?
+Trail points	body.pos / SCALE directly	❌ No
+Light positions	body.pos / SCALE directly	❌ No
+Sphere (the visible ball)	body.pos / SCALE → then through _model_matrix	✅ Yes
+Trails and lights get the correct position directly. The visible sphere goes through _model_matrix — which is broken — so it ends up in the wrong place.
+
+That's why trails and lights go to where the star SHOULD be, but the star itself stays nearly still. The sphere isn't where the physics says it is.
+
+The Actual Bug — Matrix Multiplication Order
+Open your file and find _model_matrix. You'll see this on the last line:
+
+return S @ Zt @ R @ T
+In 3D graphics, you build a "model matrix" by combining four transforms:
+
+S = Scale (resize the sphere to the correct visual size)
+Zt = Tilt (axial tilt, like Earth's 23.5°)
+R = Rotate (spin on its axis)
+T = Translate (move to world position)
+These must happen in a specific order. Think of it like getting a parcel ready to ship:
+
+Put the item in the box (scale)
+Seal the box (tilt/rotate)
+Address the label and send it (translate)
+If you address the box first and THEN resize it, the address gets shrunk with the box. That's exactly what's happening: S @ Zt @ R @ T means scale is applied last, which shrinks the translation too.
+
+The Numbers
+Earth's radius (GL display size) is approximately 0.00364. Earth's GL position from the Sun is 1.0 AU / (2 AU SCALE) = 0.5 units.
+
+With the wrong order, the translation gets multiplied by the radius:
+
+0.5 × 0.00364 = 0.00182 units from the Sun
+That's basically sitting ON the Sun. Mercury, Venus, Mars, Jupiter, Saturn all do the same thing — they all collapse to a tiny cluster right at the Sun.
+
+Binary stars have a bigger radius (~0.07), so they collapse less but still appear much closer together than they should, making them look like they're spinning in place.
+
+Fix 1 — The Matrix Order (Fixes ALL Your Visual Bugs)
+Find It
+Search for:
+
+return S @ Zt @ R @ T
+Delete This
+    def _model_matrix(self, gl_pos, radius, rotation, axial_tilt_deg):
+        tilt_rad = math.radians(axial_tilt_deg)
+        T  = matrix44.create_from_translation(gl_pos.astype('f4'), dtype='f4')
+        Zt = matrix44.create_from_z_rotation(tilt_rad,             dtype='f4')
+        R  = matrix44.create_from_y_rotation(rotation,             dtype='f4')
+        S  = matrix44.create_from_scale([radius]*3,                dtype='f4')
+        return S @ Zt @ R @ T
+Replace With This
+    def _model_matrix(self, gl_pos, radius, rotation, axial_tilt_deg):
+        tilt_rad = math.radians(axial_tilt_deg)
+        T  = matrix44.create_from_translation(gl_pos.astype('f4'), dtype='f4')
+        Zt = matrix44.create_from_z_rotation(tilt_rad,             dtype='f4')
+        R  = matrix44.create_from_y_rotation(rotation,             dtype='f4')
+        S  = matrix44.create_from_scale([radius]*3,                dtype='f4')
+        # Correct order (read right to left):
+        # 1. S  — resize the unit sphere to body.radius
+        # 2. Zt — apply axial tilt (e.g. Earth's 23.5 degree lean)
+        # 3. R  — spin on the now-tilted axis
+        # 4. T  — move the finished sphere to its world position
+        return T @ R @ Zt @ S
+What You'll See After This Fix
+✅ Binary stars orbit each other across real visible distance
+✅ Planets spread out from the Sun at correct distances
+✅ Trails follow the actual star spheres instead of running away from them
+✅ Lighting comes from where the stars visually are
+Fix 2 — Planets Getting a Glow Halo (Secondary Visual Bug)
+Once you fix the matrix order and can actually see all your planets, you'll notice every planet has a glowing halo around it — the same glow that's meant for stars.
+
+This is an indentation bug. The glow draw calls are sitting outside the if body.is_star: block, so they run for every body.
+
+Find It
+Search for:
+
+# Star glows
+Delete This
+        for body in self.physics.bodies:
+            if body.is_star:
+                L = star_luminosity(body.mass)
+                glow_size = body.radius * (1.0 + L ** 0.25)
+            gl_pos = (body.pos / SCALE).astype('f4')
+            self.glow_prog['star_pos'].value  = tuple(gl_pos)
+            self.glow_prog['glow_size'].value = body.radius * 5.5
+            r, g, b_c, _ = body.color
+            self.glow_prog['glow_color'].value = (r, g, b_c, 1.0)
+            self.glow_vao.render(moderngl.TRIANGLES)
+Replace With This
+        for body in self.physics.bodies:
+            # Only stars get a glow — skip planets entirely
+            if not body.is_star:
+                continue
+
+            L         = star_luminosity(body.mass)
+            glow_size = body.radius * (2.5 + L ** 0.25)  # bigger stars = bigger glow
+
+            gl_pos = (body.pos / SCALE).astype('f4')
+            self.glow_prog['star_pos'].value   = tuple(gl_pos)
+            self.glow_prog['glow_size'].value  = glow_size
+            r, g, b_c, _ = body.color
+            self.glow_prog['glow_color'].value = (r, g, b_c, 1.0)
+            self.glow_vao.render(moderngl.TRIANGLES)
+Do These Two Fixes First
+Fix 1 will resolve everything you described. Fix 2 is the next visual thing you'll notice once Fix 1 is in.
+
+After you've applied both, run the app and check:
+
+
+
+Scenario	What to verify
+Solar System (key 1)	Planets spread out from the Sun, Jupiter and Saturn visibly further away
+Binary Stars (key 2)	Two stars clearly separated, orbiting around a midpoint
+Rex Prime (key 5)	Planets orbiting each individual star separately
+If the binary stars still look off after Fix 1, check that the camera isn't following one of the stars (press R to reset the camera to origin, or T to cycle tracking off).
+
+Why the Trails Were "Running Away"
+This isn't a separate bug — it was a symptom of Fix 1's problem.
+
+The trail correctly stored body.pos / SCALE (the real physics position). The star sphere was rendering at the wrong, tiny position near the origin. So the trail dots were going to where the star ACTUALLY IS in physics space, while the sphere sat nearly still near the center. It looked like the trail was escaping the star, but actually the star was the thing in the wrong place.
+
+Once Fix 1 is applied, the sphere will move with its trail correctly.
