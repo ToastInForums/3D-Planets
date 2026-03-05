@@ -28,8 +28,8 @@ GRID_COLOR      = (0.18, 0.18, 0.30, 1.0)
 MAX_LIGHTS      = 4
 
 M_SUN           = 1.989e30
-WELL_SCALE      = 0.15
-WELL_SOFTENING  = 0.20
+WELL_SCALE      = 0.90
+WELL_SOFTENING  = 0.30
 
 # Physics stability
 # Each sub-step is capped at this many seconds.
@@ -64,8 +64,8 @@ PICK_THRESHOLD_PX = 50
 
 @dataclass
 class Body:
-    pos:        np.ndarray
-    vel:        np.ndarray
+    pos:        np.ndarray = field(compare=False)
+    vel:        np.ndarray = field(compare=False)
     mass:       float
     color:      tuple = (1.0, 1.0, 1.0, 1.0)
     name:       str   = "Body"
@@ -78,6 +78,24 @@ class Body:
     trail:     deque  = field(default_factory=lambda: deque(maxlen=600))
     trail_vbo: object = field(default=None, repr=False)
     trail_vao: object = field(default=None, repr=False)
+
+    def merge(self, other: "Body") -> None:
+        # Total mass
+        M = self.mass + other.mass
+        # Centre of mass position
+        new_pos = (self.pos * self.mass + other.pos * other.mass) / M
+        # Centre of mass velocity
+        new_vel = (self.vel * self.mass + other.vel * other.mass) / M
+        # Volume based radius merge physical radius
+        new_radius = (self.radius**3 + other.radius**3) ** (1/3)
+        # Larger bodies color
+        if other.mass > self.mass:
+            self.color = other.color
+        # Update Survivor
+        self.mass = M
+        self.pos = new_pos
+        self.vel = new_vel
+        self.radius = new_radius
 
     def release_gpu(self):
         if self.trail_vbo:
@@ -139,6 +157,29 @@ class PhysicsEngine:
         for i, b in enumerate(self.bodies):
             b.vel += 0.5 * (a0[i] + a1[i]) * dt
 
+    def handle_collisons(self, bodies: list[Body]) -> None:
+        indices_to_remove = set()
+
+        for i in range(len(bodies)):
+            if i in indices_to_remove: continue
+            for j in range(i + 1, len(bodies)):
+                if j in indices_to_remove: continue
+
+                a, b = bodies[i], bodies[j]
+                dist = np.linalg.norm(a.pos - b.pos)
+
+                hitbox_meters = (a.radius + b.radius) * (SCALE * 0.5)
+
+                if dist < hitbox_meters:
+                    if a.mass >= b.mass:
+                        a.merge(b)
+                        indices_to_remove.add(j)
+                    else:
+                        b.merge(a)
+                        indices_to_remove.add(i)
+        if indices_to_remove:
+            self.bodies[:] = [b for idx, b in enumerate(self.bodies)
+                              if idx not in indices_to_remove]
 # ============================================================
 # 3. Sphere mesh
 # ============================================================
@@ -311,6 +352,63 @@ def myBigGapingBlackHole() -> list[Body]:
         #Body(pos=np.array([-dist, 0.0, 0.0]), vel=np.array([0.0, 0.0, -15000.0]),
         #     mass=2.0e30, color=BLUE, name="Star B", is_star=True, radius=0.05, rot_speed=0.35),
 
+def scenario_chaos_cluster() -> list[Body]:
+    bodies = []
+
+    # Central star (medium mass)
+    star_mass = 0.8 * M_SUN
+    bodies.append(
+        Body(
+            pos=np.array([0.0, 0.0, 0.0]),
+            vel=np.array([0.0, 0.0, 0.0]),
+            mass=star_mass,
+            color=YELLOW,
+            name="Cluster Star",
+            is_star=True,
+            radius=0.05
+        )
+    )
+
+    # Random small bodies (asteroids / mini-planets)
+    num_bodies = 12
+    rng = np.random.default_rng()
+
+    for i in range(num_bodies):
+        # Random position within ±0.8 AU cube
+        pos = rng.uniform(-0.8 * AU, 0.8 * AU, size=3)
+
+        # Random velocity (small but chaotic)
+        vel = rng.uniform(-5000.0, 5000.0, size=3)
+
+        # Random mass between 1e22 and 5e24
+        mass = rng.uniform(1e22, 5e24)
+
+        # Random color
+        color = (
+            rng.uniform(0.2, 1.0),
+            rng.uniform(0.2, 1.0),
+            rng.uniform(0.2, 1.0),
+            1.0
+        )
+
+        # Radius scaled to mass (visual only)
+        radius = 0.01 + 0.02 * (mass / 5e24)
+
+        bodies.append(
+            Body(
+                pos=pos,
+                vel=vel,
+                mass=mass,
+                color=color,
+                name=f"Astro-{i+1}",
+                is_star=False,
+                radius=radius
+            )
+        )
+
+    return bodies
+
+
 
 SCENARIOS = {
     "1": ("Solar System", scenario_solar_system),
@@ -318,7 +416,8 @@ SCENARIOS = {
     "3": ("Figure Eight", scenario_figure_eight),
     "4": ("Star System",  scenario_star_system),
     "5": ("Rex Prime",    scenario_RexPrime),
-    "6": ("Black Hole - Test", myBigGapingBlackHole)
+    "6": ("Black Hole - Test", myBigGapingBlackHole),
+    "7": ("Chaos Cluster - Merge Test", scenario_chaos_cluster)
 }
 
 # ============================================================
@@ -821,6 +920,8 @@ class GravitySim(mglw.WindowConfig):
             dt = SIM_SPEED * self.time_step_multi
             self.physics.step(dt)
             self.sim_elapsed_days += dt / DAY
+
+            self.physics.handle_collisons(self.physics.bodies)
 
         if self.tracking_index is not None and \
            self.tracking_index < len(self.physics.bodies):
