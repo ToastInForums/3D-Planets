@@ -1,6 +1,9 @@
+# Swap out radius in merge and collisions for radius_m
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 import math
+from operator import pos
 import numpy as np
 import moderngl
 import moderngl_window as mglw
@@ -67,17 +70,23 @@ class Body:
     pos:        np.ndarray = field(compare=False)
     vel:        np.ndarray = field(compare=False)
     mass:       float
+    radius_m:   float = field(init=False)
+
     color:      tuple = (1.0, 1.0, 1.0, 1.0)
     name:       str   = "Body"
     is_star:    bool  = False
     radius:     float = 0.025
     rot_speed:  float = 1.0
+    #new_rot           = (self.rot_speed + other.rot_speed) * 0.5
     axial_tilt: float = 0.0
 
     rotation:  float  = field(default=0.0,  repr=False)
     trail:     deque  = field(default_factory=lambda: deque(maxlen=600))
     trail_vbo: object = field(default=None, repr=False)
     trail_vao: object = field(default=None, repr=False)
+
+    def __post_init__(self):
+        self.radius_m = self.radius * (AU * 0.5)
 
     def merge(self, other: "Body") -> None:
         # Total mass
@@ -86,8 +95,11 @@ class Body:
         new_pos = (self.pos * self.mass + other.pos * other.mass) / M
         # Centre of mass velocity
         new_vel = (self.vel * self.mass + other.vel * other.mass) / M
+        new_vel *= 0.97
         # Volume based radius merge physical radius
-        new_radius = (self.radius**3 + other.radius**3) ** (1/3)
+        new_radius_m = (self.radius_m**3 + other.radius_m**3) ** (1/3)
+
+        new_radius_gl = (self.radius**3 + other.radius**3) ** (1/3)
         # Larger bodies color
         if other.mass > self.mass:
             self.color = other.color
@@ -95,7 +107,9 @@ class Body:
         self.mass = M
         self.pos = new_pos
         self.vel = new_vel
-        self.radius = new_radius
+        self.radius_m = new_radius_m
+        self.radius = new_radius_gl
+        self.rot_speed = (self.rot_speed + other.rot_speed) * 0.5
 
     def release_gpu(self):
         if self.trail_vbo:
@@ -123,13 +137,30 @@ class PhysicsEngine:
             for j in range(i + 1, n):
                 diff = self.bodies[j].pos - self.bodies[i].pos
                 dist = np.linalg.norm(diff)
-                if dist < 1e6:
+                if dist < 1e3: #tiny guard
                     continue
-                unit       = diff / dist
-                mag        = G / (dist * dist)
+
+                soft = 0.5 * (self.bodies[i].radius_m + self.bodies[j].radius_m)
+                dist_soft = max(dist, soft)
+
+                unit       = diff / dist_soft
+                mag        = G / (dist_soft * dist_soft)
                 accels[i] += mag * self.bodies[j].mass * unit
                 accels[j] -= mag * self.bodies[i].mass * unit
         return accels
+    
+    def _estimate_max_accel(self):
+        max_a = 0.0
+        for i, bi in enumerate(self.bodies):
+            a = np.zeros(3)
+            for j, bj in enumerate(self.bodies):
+                if i == j: continue
+                diff = bj.pos - bi.pos
+                dist = np.linalg.norm(diff)
+                if dist < 1e6: continue 
+                a += G * bj.mass * diff / (dist**3)
+            max_a = max(max_a, np.linalg.norm(a))
+        return max_a
 
     def step(self, dt: float):
         """
@@ -142,9 +173,20 @@ class PhysicsEngine:
         Example: dt = 1024 days → ceil(1024) = 1024 sub-steps of 1 day each.
         At MAX_SUBSTEPS = 512 the cap kicks in and sub_dt becomes ~2 days,
         which is still stable for all planets including Mercury.
+
+
         """
-        substeps = min(MAX_SUBSTEPS, max(1, math.ceil(dt / MAX_SUBSTEP_S)))
-        sub_dt   = dt / substeps
+        if not self.bodies:
+            return
+        
+        max_a = self._estimate_max_accel()
+        if max_a > 0:
+            safe_dt = min(MAX_SUBSTEP_S, math.sqrt(SCALE / max_a))
+        else:
+            safe_dt = MAX_SUBSTEP_S
+
+        substeps = min(MAX_SUBSTEP_S, max(1, math.ceil(dt / safe_dt)))
+        sub_dt = dt / substeps
         for _ in range(substeps):
             self._verlet_step(sub_dt)
 
@@ -168,7 +210,7 @@ class PhysicsEngine:
                 a, b = bodies[i], bodies[j]
                 dist = np.linalg.norm(a.pos - b.pos)
 
-                hitbox_meters = (a.radius + b.radius) * (SCALE * 0.5)
+                hitbox_meters = (a.radius_m + b.radius_m) # * (SCALE * 0.5)
 
                 if dist < hitbox_meters:
                     if a.mass >= b.mass:
@@ -204,209 +246,253 @@ def build_sphere_mesh(stacks: int = 28, slices: int = 28):
 SPHERE_VERTS, SPHERE_INDICES = build_sphere_mesh()
 
 # ============================================================
+# Orbital Mechanics Helpers + Mechanics Helpers
+# ============================================================
+def kepler_to_cartesian(a, e, M_central, inc=0.0, omega=0.0, Omega=0.0):
+    f = 0.0  # true anomaly at periapsis
+    r = a * (1 - e**2) / (1 + e * math.cos(f))
+    x_orb = r * math.cos(f)
+    y_orb = r * math.sin(f)
+
+    mu = G * M_central
+    v = math.sqrt(mu * (2/r - 1/a))
+    vx_orb = 0.0
+    vy_orb = v
+
+    cosO, sinO = math.cos(Omega), math.sin(Omega)
+    cosi, sini = math.cos(inc), math.sin(inc)
+    cosw, sinw = math.cos(omega), math.sin(omega)
+
+    R11 = cosO*cosw - sinO*sinw*cosi
+    R12 = -cosO*sinw - sinO*cosw*cosi
+    R13 = sinO*sini
+    R21 = sinO*cosw + cosO*sinw*cosi
+    R22 = -sinO*sinw + cosO*cosw*cosi
+    R23 = -cosO*sini
+    R31 = sinw*sini
+    R32 = cosw*sini
+    R33 = cosi
+
+    pos = np.array([
+        R11*x_orb + R12*y_orb,
+        R21*x_orb + R22*y_orb,
+        R31*x_orb + R32*y_orb,
+    ])
+
+    vel = np.array([
+        R11*vx_orb + R12*vy_orb,
+        R21*vx_orb + R22*vy_orb,
+        R31*vx_orb + R32*vy_orb,
+    ])
+
+    return pos, vel
+
+def star_luminosity(mass):
+    m = mass / M_SUN
+    return m ** 3.5
+
+def star_temperature(mass):
+    m = mass / M_SUN
+    return 5800 * (m ** 0.5)
+
+def temp_to_color(T):
+    T = max(3000, min(12000, T))
+    x = (T - 3000) / (12000 - 3000)
+
+    r = 1.0
+    g = 0.5 + 0.5 * x
+    b = 0.3 + 0.7 * x
+    return(r, g, b, 1.0)
+
+
+# ============================================================
 # 4. Scenarios
 # ============================================================
 
+def make_star(pos, vel, mass, name, axial_tilt=0.0, rot_speed=0.5):
+    L = star_luminosity(mass)
+    T = star_temperature(mass)
+    color = temp_to_color(T)
+
+    # GL radius scaled by luminosity
+    radius_gl = 0.04 + 0.03 * (L ** 0.25)
+
+    return Body(
+        pos=pos,
+        vel=vel,
+        mass=mass,
+        color=color,
+        name=name,
+        is_star=True,
+        radius=radius_gl,
+        rot_speed=rot_speed,
+        axial_tilt=axial_tilt
+    )
+
+
 def scenario_solar_system() -> list[Body]:
+    sun = make_star(
+        pos=np.array([0.0, 0.0, 0.0]),
+        vel=np.array([0.0, 0.0, 0.0]),
+        mass=M_SUN,
+        name="Sun",
+        axial_tilt=7.25,
+        rot_speed=0.5
+    )
+
+    def R(km): return (km / 70000) * 0.04
+
     return [
-        Body(pos=np.array([0.0,         0.0, 0.0]), vel=np.array([0.0, 0.0,     0.0]),
-             mass=1.989e30, color=YELLOW, name="Sun",     is_star=True,  radius=0.060, rot_speed=0.5,   axial_tilt=7.25),
-        Body(pos=np.array([0.387 * AU,  0.0, 0.0]), vel=np.array([0.0, 0.0, 47400.0]),
-             mass=3.30e23,  color=ORANGE, name="Mercury", is_star=False, radius=0.011, rot_speed=0.017, axial_tilt=0.03),
-        Body(pos=np.array([0.723 * AU,  0.0, 0.0]), vel=np.array([0.0, 0.0, 35020.0]),
-             mass=4.87e24,  color=TAN,    name="Venus",   is_star=False, radius=0.019, rot_speed=-0.004,axial_tilt=177.4),
-        Body(pos=np.array([AU,          0.0, 0.0]), vel=np.array([0.0, 0.0, 29780.0]),
-             mass=5.972e24, color=BLUE,   name="Earth",   is_star=False, radius=0.020, rot_speed=1.0,   axial_tilt=23.4),
-        Body(pos=np.array([1.52 * AU,   0.0, 0.0]), vel=np.array([0.0, 0.0, 24007.0]),
-             mass=6.39e23,  color=RED,    name="Mars",    is_star=False, radius=0.015, rot_speed=0.97,  axial_tilt=25.2),
-        Body(pos=np.array([5.2 * AU,    0.0, 0.0]), vel=np.array([0.0, 0.0, 13100.0]),
-             mass=1.90e27,  color=BUFF,   name="Jupiter", is_star=False, radius=0.040, rot_speed=2.4,   axial_tilt=3.1),
-        Body(pos=np.array([9.58 * AU,   0.0, 0.0]), vel=np.array([0.0, 0.0,  9700.0]),
-             mass=5.68e26,  color=CREAM,  name="Saturn",  is_star=False, radius=0.034, rot_speed=2.2,   axial_tilt=26.7),
+        sun,
+
+        Body(np.array([0.387*AU,0,0]), np.array([0,0,47400]), 3.30e23,
+             color=ORANGE, name="Mercury", is_star=False, radius=R(2440)),
+
+        Body(np.array([0.723*AU,0,0]), np.array([0,0,35020]), 4.87e24,
+             color=TAN, name="Venus", is_star=False, radius=R(6052)),
+
+        Body(np.array([1.0*AU,0,0]), np.array([0,0,29780]), 5.97e24,
+             color=BLUE, name="Earth", is_star=False, radius=R(6371)),
+
+        Body(np.array([1.52*AU,0,0]), np.array([0,0,24070]), 6.39e23,
+             color=RED, name="Mars", is_star=False, radius=R(3390)),
+
+        Body(np.array([5.2*AU,0,0]), np.array([0,0,13100]), 1.90e27,
+             color=BUFF, name="Jupiter", is_star=False, radius=R(69911)),
+
+        Body(np.array([9.58*AU,0,0]), np.array([0,0,9700]), 5.68e26,
+             color=CREAM, name="Saturn", is_star=False, radius=R(58232)),
     ]
+
 
 def scenario_binary_stars() -> list[Body]:
     dist = 1 * AU
-    return [
-        Body(pos=np.array([ dist, 0.0, 0.0]), vel=np.array([0.0, 0.0,  18000.0]),
-             mass=2e30, color=BLUE,    name="Star A", is_star=True, radius=0.05, rot_speed=0.3, axial_tilt=5.0),
-        Body(pos=np.array([-dist, 0.0, 0.0]), vel=np.array([0.0, 0.0, -18000.0]),
-             mass=2e30, color=GREEN, name="Star B", is_star=True, radius=0.05, rot_speed=0.3, axial_tilt=3.0),
-    ]
+    M = 2e30
+    v = math.sqrt(G * M / dist)
+
+    starA = make_star(np.array([ dist,0,0]), np.array([0,0, v]), M, "Star A")
+    starB = make_star(np.array([-dist,0,0]), np.array([0,0,-v]), M, "Star B")
+
+    return [starA, starB]
+
+
 
 def scenario_figure_eight() -> list[Body]:
-    M  = 1.0e30
-    L  = 0.5 * AU
+    M = 1.0e30
+    L = 0.5 * AU
     v0 = math.sqrt(G * M / L)
+
     px, pz = 0.97000436 * L, 0.24308753 * L
     vx, vz = 0.46620368 * v0, 0.43236573 * v0
-    return [
-        Body(pos=np.array([-px, 0.0,  pz]), vel=np.array([ vx, 0.0,  vz]),
-             mass=M, color=RED,  name="Body A", is_star=True, radius=0.04, rot_speed=0.4),
-        Body(pos=np.array([ px, 0.0, -pz]), vel=np.array([ vx, 0.0,  vz]),
-             mass=M, color=BLUE, name="Body B", is_star=True, radius=0.04, rot_speed=0.4),
-        Body(pos=np.array([ 0.0, 0.0, 0.0]), vel=np.array([-2*vx, 0.0, -2*vz]),
-             mass=M, color=CYAN, name="Body C", is_star=True, radius=0.04, rot_speed=0.4),
-    ]
+
+    A = make_star(np.array([-px,0,pz]), np.array([vx,0,vz]), M, "Body A")
+    B = make_star(np.array([ px,0,-pz]), np.array([vx,0,vz]), M, "Body B")
+    C = make_star(np.array([0,0,0]),     np.array([-2*vx,0,-2*vz]), M, "Body C")
+
+    return [A, B, C]
+
 
 def scenario_star_system() -> list[Body]:
     dist = 0.5 * AU
-    return [
-        Body(pos=np.array([ dist, 0.0, 0.0]), vel=np.array([0.0, 0.0,  15000.0]),
-             mass=2.0e30, color=RED,  name="Star A", is_star=True, radius=0.05, rot_speed=0.35),
-        Body(pos=np.array([-dist, 0.0, 0.0]), vel=np.array([0.0, 0.0, -15000.0]),
-             mass=2.0e30, color=BLUE, name="Star B", is_star=True, radius=0.05, rot_speed=0.35),
-    ]
+    M = 2e30
+    v = math.sqrt(G * M / dist)
+
+    A = make_star(np.array([ dist,0,0]), np.array([0,0, v]), M, "Star A")
+    B = make_star(np.array([-dist,0,0]), np.array([0,0,-v]), M, "Star B")
+
+    return [A, B]
+
 
 def scenario_RexPrime() -> list[Body]:
-    # Masses
-    M_A = 1.1 * M_SUN   # Star A (slightly heavier)
-    M_B = 0.9 * M_SUN   # Star B (slightly lighter)
+    M_A = 1.1 * M_SUN
+    M_B = 0.9 * M_SUN
     M_tot = M_A + M_B
 
-    # Binary separation
     a_bin = 3.5 * AU
-
-    # Distances from barycenter
     r_A = a_bin * (M_B / M_tot)
     r_B = a_bin * (M_A / M_tot)
 
-    # Angular frequency
     omega = math.sqrt(G * M_tot / (a_bin ** 3))
 
-    # Star A: nearly circular
     vA = omega * r_A
+    vB = omega * r_B
 
-    # Star B: slightly elliptical (reduce speed 10%)
-    vB = 0.90 * omega * r_B
+    starA = make_star(np.array([+r_A,0,0]), np.array([0,0,+vA]), M_A, "Rex Star A")
+    starB = make_star(np.array([-r_B,0,0]), np.array([0,0,-vB]), M_B, "Rex Star B")
 
-    starA_pos = np.array([+r_A, 0, 0])
-    starB_pos = np.array([-r_B, 0, 0])
+    def R(km): return (km / 70000) * 0.04
 
-    starA_vel = np.array([0, 0, +vA])
-    starB_vel = np.array([0, 0, -vB])
-
-    # -----------------------------
-    # Planets around Star A (2)
-    # -----------------------------
+    # Planets
     r_PA1 = 0.35 * AU
     r_PA2 = 0.65 * AU
-
-    v_PA1 = math.sqrt(G * M_A / r_PA1)
-    v_PA2 = math.sqrt(G * M_A / r_PA2)
-
-    pA1_pos = starA_pos + np.array([r_PA1, 0, 0])
-    pA2_pos = starA_pos + np.array([r_PA2, 0, 0])
-
-    pA1_vel = starA_vel + np.array([0, 0, +v_PA1])
-    pA2_vel = starA_vel + np.array([0, 0, +v_PA2])
-
-    # -----------------------------
-    # Planet around Star B (1)
-    # -----------------------------
     r_PB1 = 0.30 * AU
-    v_PB1 = math.sqrt(G * M_B / r_PB1)
 
-    pB1_pos = starB_pos + np.array([r_PB1, 0, 0])
-    pB1_vel = starB_vel + np.array([0, 0, -v_PB1])
+    pA1 = Body(starA.pos + np.array([r_PA1,0,0]),
+               starA.vel + np.array([0,0,math.sqrt(G*M_A/r_PA1)]),
+               5.97e24, color=GREEN, name="Rex Prime", radius=R(6371))
 
-    # -----------------------------
-    # Circumbinary planets (2)
-    # -----------------------------
-    # Must be > 3 × a_bin = 10.5 AU
-    r_CB1 = 12.0 * AU   # circular
-    r_CB2 = 16.0 * AU   # elliptical
+    pA2 = Body(starA.pos + np.array([r_PA2,0,0]),
+               starA.vel + np.array([0,0,math.sqrt(G*M_A/r_PA2)]),
+               4.87e24, color=BLUE, name="Rex Minor", radius=R(6052))
 
-    v_CB1 = math.sqrt(G * M_tot / r_CB1)
-    v_CB2 = 0.85 * math.sqrt(G * M_tot / r_CB2)  # elliptical
+    pB1 = Body(starB.pos + np.array([r_PB1,0,0]),
+               starB.vel + np.array([0,0,-math.sqrt(G*M_B/r_PB1)]),
+               6.39e23, color=CYAN, name="Rex Ember", radius=R(3390))
 
-    cb1_pos = np.array([r_CB1, 0, 0])
-    cb1_vel = np.array([0, 0, +v_CB1])
+    # Circumbinary
+    r_CB1 = 12 * AU
+    r_CB2 = 16 * AU
 
-    cb2_pos = np.array([-r_CB2, 0, 0])
-    cb2_vel = np.array([0, 0, -v_CB2])
+    cb1 = Body(np.array([r_CB1,0,0]), np.array([0,0,math.sqrt(G*M_tot/r_CB1)]),
+               5e24, color=CREAM, name="Rex Outer I", radius=R(7000))
 
-    return [
-        Body(starA_pos, starA_vel, M_A, YELLOW, "Rex Star A", True, 0.06),
-        Body(starB_pos, starB_vel, M_B, ORANGE, "Rex Star B", True, 0.055),
+    cb2 = Body(np.array([-r_CB2,0,0]), np.array([0,0,-0.85*math.sqrt(G*M_tot/r_CB2)]),
+               5e24, color=RED, name="Rex Outer II", radius=R(7000))
 
-        Body(pA1_pos, pA1_vel, 5.97e24, GREEN, "Rex Prime", False, 0.018),
-        Body(pA2_pos, pA2_vel, 4.87e24, BLUE, "Rex Minor", False, 0.016),
-
-        Body(pB1_pos, pB1_vel, 6.39e23, CYAN, "Rex Ember", False, 0.014),
-
-        Body(cb1_pos, cb1_vel, 5e24, CREAM, "Rex Outer I", False, 0.020),
-        Body(cb2_pos, cb2_vel, 5e24, RED, "Rex Outer II", False, 0.022),
-    ]
+    return [starA, starB, pA1, pA2, pB1, cb1, cb2]
 
 
 def myBigGapingBlackHole() -> list[Body]:
-    return [
-        Body(pos=np.array([0.0,       0.0,0.0]), vel=np.array([0.0,   0.0,0.0]), 
-             mass=30e30, color=GREEN, name="Blacky", is_star=True, radius=0.5,),
-        
-        Body(pos=np.array([5.0 * AU,       0.0,0.0]), vel=np.array([0.0,   0.0, 14000.0]), 
-             mass=2e24, color=BLUE, name="Planety", is_star=False, radius=0.05,),
-    ]
+    BH_mass = 30 * M_SUN
+    # Schwarzschild radius = 2GM/c^2
+    Rs = 2 * G * BH_mass / (3e8**2)
+    Rs_km = Rs / 1000
 
-        #Body(pos=np.array([-dist, 0.0, 0.0]), vel=np.array([0.0, 0.0, -15000.0]),
-        #     mass=2.0e30, color=BLUE, name="Star B", is_star=True, radius=0.05, rot_speed=0.35),
+    def R(km): return (km / 70000) * 0.04
+
+    return [
+        Body(np.array([0,0,0]), np.array([0,0,0]), BH_mass,
+             color=GREEN, name="Blacky", is_star=True, radius=R(Rs_km)),
+
+        Body(np.array([5*AU,0,0]), np.array([0,0,14000]), 2e24,
+             color=BLUE, name="Planety", radius=R(6000)),
+    ]
 
 def scenario_chaos_cluster() -> list[Body]:
     bodies = []
 
-    # Central star (medium mass)
     star_mass = 0.8 * M_SUN
     bodies.append(
-        Body(
-            pos=np.array([0.0, 0.0, 0.0]),
-            vel=np.array([0.0, 0.0, 0.0]),
-            mass=star_mass,
-            color=YELLOW,
-            name="Cluster Star",
-            is_star=True,
-            radius=0.05
-        )
+        Body(np.array([0,0,0]), np.array([0,0,0]), star_mass,
+             color=YELLOW, name="Cluster Star", is_star=True, radius=0.05)
     )
 
-    # Random small bodies (asteroids / mini-planets)
-    num_bodies = 12
     rng = np.random.default_rng()
+    def R_from_mass(m): return 0.01 + 0.02 * (m / 5e24)
 
-    for i in range(num_bodies):
-        # Random position within ±0.8 AU cube
-        pos = rng.uniform(-0.8 * AU, 0.8 * AU, size=3)
-
-        # Random velocity (small but chaotic)
-        vel = rng.uniform(-5000.0, 5000.0, size=3)
-
-        # Random mass between 1e22 and 5e24
+    for i in range(12):
+        pos = rng.uniform(-0.8*AU, 0.8*AU, size=3)
+        vel = rng.uniform(-5000, 5000, size=3)
         mass = rng.uniform(1e22, 5e24)
-
-        # Random color
-        color = (
-            rng.uniform(0.2, 1.0),
-            rng.uniform(0.2, 1.0),
-            rng.uniform(0.2, 1.0),
-            1.0
-        )
-
-        # Radius scaled to mass (visual only)
-        radius = 0.01 + 0.02 * (mass / 5e24)
+        color = (rng.uniform(0.2,1.0), rng.uniform(0.2,1.0), rng.uniform(0.2,1.0), 1.0)
 
         bodies.append(
-            Body(
-                pos=pos,
-                vel=vel,
-                mass=mass,
-                color=color,
-                name=f"Astro-{i+1}",
-                is_star=False,
-                radius=radius
-            )
+            Body(pos, vel, mass, color=color,
+                 name=f"Astro-{i+1}", radius=R_from_mass(mass))
         )
 
     return bodies
+
 
 
 
@@ -677,6 +763,7 @@ class GravitySim(mglw.WindowConfig):
         self.camera_yaw    = -math.pi / 2
         self.camera_pitch  = -math.pi / 6
         self.camera_radius = 5.0
+        self.use_barycentric_camera = False
 
         self.physics = PhysicsEngine([])
 
@@ -773,6 +860,9 @@ class GravitySim(mglw.WindowConfig):
 
     # ------------------------------------------------------------------
     def _get_matrices(self):
+        if self.use_barycentric_camera and self.tracking_index is None:
+            self.camera_target = self._barycenter().astype('f4')
+
         x = self.camera_radius * math.cos(self.camera_pitch) * math.cos(self.camera_yaw)
         y = self.camera_radius * math.sin(self.camera_pitch)
         z = self.camera_radius * math.cos(self.camera_pitch) * math.sin(self.camera_yaw)
@@ -854,6 +944,10 @@ class GravitySim(mglw.WindowConfig):
                 else: self._focus_body(self.selected_index)
             elif self.tracking_index is not None:
                 self._unfocus()
+        if key == K.B:
+            self.use_barycentric_camera = not self.use_barycentric_camera
+            print("Barycentric camera:", self.use_barycentric_camera)
+
 
     def on_mouse_press_event(self, x, y, button):
         if button != 1: return
@@ -963,7 +1057,9 @@ class GravitySim(mglw.WindowConfig):
         self.glow_prog['projection'].write(proj)
         self.glow_prog['view'].write(view)
         for body in self.physics.bodies:
-            if not body.is_star: continue
+            if body.is_star:
+                L = star_luminosity(body.mass)
+                glow_size = body.radius * (1.0 + L ** 0.25)
             gl_pos = (body.pos / SCALE).astype('f4')
             self.glow_prog['star_pos'].value  = tuple(gl_pos)
             self.glow_prog['glow_size'].value = body.radius * 5.5
@@ -1009,6 +1105,31 @@ class GravitySim(mglw.WindowConfig):
                 HEIGHT - hint.height - PANEL_MARGIN)
         self.ctx.enable(moderngl.DEPTH_TEST)
 
+    # ── Camera Shizz ───────────────────────────────────────────────
+    def _barycenter(self):
+        if not self.physics.bodies:
+            return np.zeros(3, dtype='f4')
+        M = sum(b.mass for b in self.physics.bodies)
+
+
+
 # ============================================================
 if __name__ == '__main__':
     mglw.run_window_config(GravitySim)
+
+
+
+"""
+def total_energy(self):
+    K = 0.0
+    U = 0.0
+    for i in bi in enumerate(self.bodies):
+        K += 0.5 bi.mass * np.dot(bi.vel, bi.vel)
+        for j in range(i + 1, len(self.bodies)):
+            bj = self.bodies[j]
+            r = np.linalg.norm[bi.pos - bj.pos]
+            if r > 0:
+                U -= G * bi.mass * bj.mass / r
+    return K + U
+
+"""
