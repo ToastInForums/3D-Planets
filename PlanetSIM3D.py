@@ -242,9 +242,6 @@ class PhysicsEngine:
 
         if to_remove:
             self.bodies = [b for idx, b in enumerate(self.bodies) if idx not in to_remove]
-
-
-
 # ============================================================
 # 3. Sphere mesh
 # ============================================================
@@ -821,6 +818,17 @@ class GravitySim(mglw.WindowConfig):
         self._print_controls()
 
     # ------------------------------------------------------------------
+    def validate_indices(self):
+        # selected
+        if self.selected_index is not None:
+            if self.selected_index >= len(self.physics.bodies):
+                self.selected_index = None
+
+        # tracking
+        if self.tracking_index is not None:
+            if self.tracking_index >= len(self.physics.bodies):
+                self.tracking_index = None
+    # ------------------------------------------------------------------
     def _init_grid(self, size, divisions):
         n    = divisions + 1
         pts  = np.linspace(-size, size, n, dtype='f4')
@@ -1043,6 +1051,7 @@ class GravitySim(mglw.WindowConfig):
             
             # 2. Update Physics
             self.physics.step(dt)
+            self.validate_indices()
             self.sim_elapsed_days += dt / DAY
 
             # 3. Check collisions using that same dt
