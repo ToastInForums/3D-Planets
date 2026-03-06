@@ -489,7 +489,7 @@ def myBigGapingBlackHole() -> list[Body]:
 
     return [
         Body(np.array([0,0,0]), np.array([0,0,0]), BH_mass,
-             color=GREEN, name="Blacky", is_star=True, radius=2.5),
+             color=GREEN, name="Blacky", is_star=True, radius=1.0),
 
         Body(np.array([5*AU,0,0]), np.array([0,0,14000]), 2e24,
              color=BLUE, name="Planety", radius=R(6000)),
