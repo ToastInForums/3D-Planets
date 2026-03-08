@@ -17,6 +17,8 @@ from PIL import Image, ImageDraw, ImageFont
 WIDTH, HEIGHT   = 1200, 800
 TITLE           = "3D Gravity Simulation"
 
+
+
 G               = 6.6740e-11
 AU              = 149.6e9
 DAY             = 3600 * 24
