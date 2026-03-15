@@ -384,7 +384,7 @@ def scenario_solar_system() -> list[Body]:
              color=RED, name="Mars", is_star=False, radius=R(3390)),
 
         Body(np.array([5.2*AU,0,0]), np.array([0,0,13100]), 1.90e27,
-             color=BUFF, name="Jupiter", is_star=False, radius=R(69911)),
+            color=BUFF, name="Jupiter", is_star=False, radius=R(69911)),
 
         Body(np.array([9.58*AU,0,0]), np.array([0,0,9700]), 5.68e26,
              color=CREAM, name="Saturn", is_star=False, radius=R(58232)),
@@ -500,7 +500,7 @@ def scenario_chaos_cluster() -> list[Body]:
     star_mass = 0.8 * M_SUN
     bodies.append(
         Body(np.array([0,0,0]), np.array([0,0,0]), star_mass,
-             color=YELLOW, name="Cluster Star", is_star=True, radius=0.5)
+             color=YELLOW, name="Cluster Star", is_star=True, radius=0.2)
     )
 
     rng = np.random.default_rng()
