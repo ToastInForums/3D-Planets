@@ -1,5 +1,3 @@
-# Swap out radius in merge and collisions for radius_m
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 import math
@@ -301,14 +299,14 @@ def kepler_to_cartesian(a, e, M_central, inc=0.0, omega=0.0, Omega=0.0):
 
     pos = np.array([
         R11*x_orb + R12*y_orb,
-        R21*x_orb + R22*y_orb,
         R31*x_orb + R32*y_orb,
+        R21*x_orb + R22*y_orb,
     ])
 
     vel = np.array([
         R11*vx_orb + R12*vy_orb,
-        R21*vx_orb + R22*vy_orb,
         R31*vx_orb + R32*vy_orb,
+        R21*vx_orb + R22*vy_orb,
     ])
 
     return pos, vel
@@ -357,44 +355,32 @@ def make_star(pos, vel, mass, name, axial_tilt=0.0, rot_speed=0.5):
 
 
 def scenario_solar_system() -> list[Body]:
-    sun = make_star(
-        pos=np.array([0.0, 0.0, 0.0]),
-        vel=np.array([0.0, 0.0, 0.0]),
-        mass=M_SUN,
-        name="Sun",
-        axial_tilt=7.25,
-        rot_speed=0.5
-    )
+    sun = make_star(np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0]),
+                    M_SUN, "Sun", axial_tilt=7.25, rot_speed=0.5)
 
-    def R(km): return (km / 70000) * 0.04
+    def make_planet(a_au, e, inc_deg, mass, color, name, radius_km):
+        a   = a_au * AU
+        inc = math.radians(inc_deg)
+        pos, vel = kepler_to_cartesian(a, e, M_SUN, inc=inc)
+        r = (radius_km / 70000) * 0.04
+        return Body(pos, vel, mass, color=color, name=name, radius=r)
 
     return [
         sun,
-
-        Body(np.array([0.387*AU,0,0]), np.array([0,0,47400]), 3.30e23,
-             color=ORANGE, name="Mercury", is_star=False, radius=R(2440)),
-
-        Body(np.array([0.723*AU,0,0]), np.array([0,0,35020]), 4.87e24,
-             color=TAN, name="Venus", is_star=False, radius=R(6052)),
-
-        Body(np.array([1.0*AU,0,0]), np.array([0,0,29780]), 5.97e24,
-             color=BLUE, name="Earth", is_star=False, radius=R(6371)),
-
-        Body(np.array([1.52*AU,0,0]), np.array([0,0,24070]), 6.39e23,
-             color=RED, name="Mars", is_star=False, radius=R(3390)),
-
-        Body(np.array([5.2*AU,0,0]), np.array([0,0,13100]), 1.90e27,
-            color=BUFF, name="Jupiter", is_star=False, radius=R(69911)),
-
-        Body(np.array([9.58*AU,0,0]), np.array([0,0,9700]), 5.68e26,
-             color=CREAM, name="Saturn", is_star=False, radius=R(58232)),
+        #                  a(AU)   e      inc(°)
+        make_planet(  0.387, 0.206,  7.0,  3.30e23, ORANGE, "Mercury", 2440),
+        make_planet(  0.723, 0.007,  3.4,  4.87e24, TAN,    "Venus",   6052),
+        make_planet(  1.000, 0.017,  0.0,  5.97e24, BLUE,   "Earth",   6371),
+        make_planet(  1.524, 0.093,  1.9,  6.39e23, RED,    "Mars",    3390),
+        make_planet(  5.204, 0.049,  1.3,  1.90e27, BUFF,   "Jupiter", 69911),
+        make_planet(  9.582, 0.057,  2.5,  5.68e26, CREAM,  "Saturn",  58232),
     ]
 
 
 def scenario_binary_stars() -> list[Body]:
     dist = 1 * AU
     M = 2e30
-    v = math.sqrt(G * M / dist)
+    v = math.sqrt(G * M / 4 / dist)
 
     starA = make_star(np.array([ dist,0,0]), np.array([0,0, v]), M, "Star A")
     starB = make_star(np.array([-dist,0,0]), np.array([0,0,-v]), M, "Star B")
