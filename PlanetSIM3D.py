@@ -15,8 +15,6 @@ from PIL import Image, ImageDraw, ImageFont
 WIDTH, HEIGHT   = 1200, 800
 TITLE           = "3D Gravity Simulation"
 
-
-
 G               = 6.6740e-11
 AU              = 149.6e9
 DAY             = 3600 * 24
@@ -34,15 +32,10 @@ M_SUN           = 1.989e30
 WELL_SCALE      = 0.90
 WELL_SOFTENING  = 0.30
 
-# Physics stability
-# Each sub-step is capped at this many seconds.
-# 1 day = 86400 s keeps inner-planet orbits stable at any speed multiplier.
-MAX_SUBSTEP_S   = DAY * 1.0      # 1 simulated day per sub-step max
-MAX_SUBSTEPS    = 512            # hard ceiling so we don't stall on extreme speeds
-
-# Trail safety: if a body moves more than this in GL units between two recorded
-# trail points, the jump is treated as an ejection artefact and the trail is cleared.
-TRAIL_MAX_JUMP  = 1.5            # GL units  (~3 AU at SCALE = 2 AU)
+MAX_SUBSTEP_S   = DAY * 1.0
+MAX_SUBSTEPS    = 512
+TRAIL_MAX_JUMP  = 1.5
+TRAIL_WIDTH     = 2.0 # pixels — change this freely
 
 # Colors (RGBA 0–1)
 YELLOW  = (1.0,  0.95, 0.3,  1.0)
@@ -76,8 +69,8 @@ class Body:
     is_star:    bool  = False
     radius:     float = 0.025
     rot_speed:  float = 1.0
-    #new_rot           = (self.rot_speed + other.rot_speed) * 0.5
     axial_tilt: float = 0.0
+    has_rings:  bool  = False
 
     rotation:  float  = field(default=0.0,  repr=False)
     trail:     deque  = field(default_factory=lambda: deque(maxlen=600))
@@ -85,28 +78,19 @@ class Body:
     trail_vao: object = field(default=None, repr=False)
 
     def __post_init__(self):
-        # Force position and velocity to be float arrays
         self.pos = np.asarray(self.pos, dtype=np.float64)
         self.vel = np.asarray(self.vel, dtype=np.float64)
 
     def merge(self, other: "Body") -> None:
-        # 1. Physical Merge (Conservation of Momentum)
         total_m = self.mass + other.mass
-        # New velocity = (m1v1 + m2v2) / (m1 + m2)
         self.vel = (self.vel * self.mass + other.vel * other.mass) / total_m
-        self.vel *= 0.97  # Slight energy loss
-        
+        self.vel *= 0.97
         self.pos = (self.pos * self.mass + other.pos * other.mass) / total_m
-        
-        # 2. Visual Merge
         if other.mass > self.mass:
             self.color = other.color
-            
         self.radius = (self.radius**3 + other.radius**3) ** (1/3)
         self.mass = total_m
         self.rot_speed = (self.rot_speed + other.rot_speed) * 0.5
-        
-        # 3. Cleanup: Important for ModernGL!
         other.release_gpu()
 
     def release_gpu(self):
@@ -129,71 +113,42 @@ class PhysicsEngine:
         self.bodies = bodies
 
     def _compute_accels(self):
-        n      = len(self.bodies)
-        accels = [np.zeros(3) for _ in range(n)]
+        if len(self.bodies) < 2:
+            return [np.zeros(3) for _ in self.bodies]
 
-        def r_m(b): return b.radius * SCALE
+        pos  = np.array([b.pos  for b in self.bodies])
+        mass = np.array([b.mass for b in self.bodies])
+        soft = np.array([b.radius * SCALE for b in self.bodies])
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                diff = self.bodies[j].pos - self.bodies[i].pos
-                dist = np.linalg.norm(diff)
-                if dist < 1e3:
-                    continue
+        diff  = pos[np.newaxis, :, :] - pos[:, np.newaxis, :]
+        dist2 = np.einsum('ijk,ijk->ij', diff, diff)
 
-                soft = 0.5 * (r_m(self.bodies[i]) + r_m(self.bodies[j]))
-                dist_soft = max(dist, soft)
+        soft_mat = (soft[:, np.newaxis] + soft[np.newaxis, :]) * 0.5
+        dist2 = np.maximum(dist2, soft_mat ** 2)
 
-                unit = diff / dist_soft
-                mag  = G / (dist_soft * dist_soft)
+        dist3 = dist2 ** 1.5
+        np.fill_diagonal(dist3, 1.0)
 
-                accels[i] += mag * self.bodies[j].mass * unit
-                accels[j] -= mag * self.bodies[i].mass * unit
+        coeff = G * mass[np.newaxis, :] / dist3
+        np.fill_diagonal(coeff, 0.0)
+        accels = np.einsum('ij,ijk->ik', coeff, diff)
+        return list(accels)
 
-        return accels
-
-    
     def _estimate_max_accel(self):
-        max_a = 0.0
-        for i, bi in enumerate(self.bodies):
-            a = np.zeros(3)
-            for j, bj in enumerate(self.bodies):
-                if i == j: continue
-                diff = bj.pos - bi.pos
-                dist = np.linalg.norm(diff)
-                if dist < 1e6: continue 
-                a += G * bj.mass * diff / (dist**3)
-            max_a = max(max_a, np.linalg.norm(a))
-        return max_a
+        accels = self._compute_accels()
+        if not accels: return 0.0
+        return max(np.linalg.norm(a) for a in accels)
 
     def step(self, dt: float):
-        """
-        Adaptive Velocity-Verlet integration.
-
-        Instead of a fixed substep count, we divide dt into sub-steps that are
-        each at most MAX_SUBSTEP_S seconds long. This means that no matter how
-        large the speed multiplier is, the physics always sees manageable steps.
-
-        Example: dt = 1024 days → ceil(1024) = 1024 sub-steps of 1 day each.
-        At MAX_SUBSTEPS = 512 the cap kicks in and sub_dt becomes ~2 days,
-        which is still stable for all planets including Mercury.
-
-
-        """
-        substeps = 10
-        sub_dt = dt / substeps
         if not self.bodies:
             return
-        
         max_a = self._estimate_max_accel()
         if max_a > 0:
             safe_dt = min(MAX_SUBSTEP_S, math.sqrt(SCALE / max_a))
         else:
             safe_dt = MAX_SUBSTEP_S
-
-        substeps = min(MAX_SUBSTEP_S, max(1, math.ceil(dt / safe_dt)))
+        substeps = min(MAX_SUBSTEPS, max(1, math.ceil(dt / safe_dt)))
         sub_dt = dt / substeps
-
         for _ in range(substeps):
             self._verlet_step(sub_dt)
             self.handle_collisions(dt)
@@ -211,37 +166,27 @@ class PhysicsEngine:
         to_remove = set()
         num_bodies = len(self.bodies)
 
-        def r_m(b): return b.radius * SCALE  # convert GL radius → meters
+        def r_m(b): return b.radius * SCALE
 
         for i in range(num_bodies):
             if i in to_remove: continue
             for j in range(i + 1, num_bodies):
                 if j in to_remove: continue
-
                 a, b = self.bodies[i], self.bodies[j]
-
                 diff = a.pos - b.pos
                 dist = np.linalg.norm(diff)
-
-                
-
                 rel_vel_vec = a.vel - b.vel
                 next_dist = np.linalg.norm(diff + rel_vel_vec * dt)
-
                 hitbox = r_m(a) + r_m(b)
-
                 if dist < hitbox or next_dist < hitbox:
                     print(f"COLLISION: {a.name} hits {b.name}  dist={dist:.3e}  hitbox={hitbox:.3e}")
                     if a.mass >= b.mass:
-                        a.merge(b)
-                        to_remove.add(j)
+                        a.merge(b); to_remove.add(j)
                     else:
-                        b.merge(a)
-                        to_remove.add(i)
-                        break
-
+                        b.merge(a); to_remove.add(i); break
         if to_remove:
             self.bodies = [b for idx, b in enumerate(self.bodies) if idx not in to_remove]
+
 # ============================================================
 # 3. Sphere mesh
 # ============================================================
@@ -266,256 +211,175 @@ def build_sphere_mesh(stacks: int = 28, slices: int = 28):
 SPHERE_VERTS, SPHERE_INDICES = build_sphere_mesh()
 
 # ============================================================
-# Orbital Mechanics Helpers + Mechanics Helpers
+# Ring mesh
 # ============================================================
+
+def build_ring_mesh(inner=1.45, outer=2.35, segments=120):
+    verts = []
+    for i in range(segments + 1):
+        angle = 2 * math.pi * i / segments
+        c, s = math.cos(angle), math.sin(angle)
+        verts += [inner * c, 0.0, inner * s]
+        verts += [outer * c, 0.0, outer * s]
+    indices = []
+    for i in range(segments):
+        a = i * 2; b = i * 2 + 1
+        indices += [a, b, a + 2, b, b + 2, a + 2]
+    return np.array(verts, dtype='f4'), np.array(indices, dtype='i4')
+
+RING_VERTS, RING_INDICES = build_ring_mesh()
+
+# ============================================================
+# Orbital Mechanics Helpers
+# ============================================================
+
 def radius_to_meters(r_gl: float) -> float:
     return r_gl * SCALE
 
-
 def kepler_to_cartesian(a, e, M_central, inc=0.0, omega=0.0, Omega=0.0):
-    f = 0.0  # true anomaly at periapsis
+    f = 0.0
     r = a * (1 - e**2) / (1 + e * math.cos(f))
     x_orb = r * math.cos(f)
     y_orb = r * math.sin(f)
-
     mu = G * M_central
     v = math.sqrt(mu * (2/r - 1/a))
     vx_orb = 0.0
     vy_orb = v
-
     cosO, sinO = math.cos(Omega), math.sin(Omega)
     cosi, sini = math.cos(inc), math.sin(inc)
     cosw, sinw = math.cos(omega), math.sin(omega)
-
     R11 = cosO*cosw - sinO*sinw*cosi
     R12 = -cosO*sinw - sinO*cosw*cosi
-    R13 = sinO*sini
     R21 = sinO*cosw + cosO*sinw*cosi
     R22 = -sinO*sinw + cosO*cosw*cosi
-    R23 = -cosO*sini
     R31 = sinw*sini
     R32 = cosw*sini
-    R33 = cosi
-
-    pos = np.array([
-        R11*x_orb + R12*y_orb,
-        R31*x_orb + R32*y_orb,
-        R21*x_orb + R22*y_orb,
-    ])
-
-    vel = np.array([
-        R11*vx_orb + R12*vy_orb,
-        R31*vx_orb + R32*vy_orb,
-        R21*vx_orb + R22*vy_orb,
-    ])
-
+    pos = np.array([R11*x_orb + R12*y_orb, R31*x_orb + R32*y_orb, R21*x_orb + R22*y_orb])
+    vel = np.array([R11*vx_orb + R12*vy_orb, R31*vx_orb + R32*vy_orb, R21*vx_orb + R22*vy_orb])
     return pos, vel
 
 def star_luminosity(mass):
-    m = mass / M_SUN
-    return m ** 3.5
+    return (mass / M_SUN) ** 3.5
 
 def star_temperature(mass):
-    m = mass / M_SUN
-    return 5800 * (m ** 0.5)
+    return 5800 * ((mass / M_SUN) ** 0.5)
 
 def temp_to_color(T):
     T = max(3000, min(12000, T))
     x = (T - 3000) / (12000 - 3000)
-
-    r = 1.0
-    g = 0.5 + 0.5 * x
-    b = 0.3 + 0.7 * x
-    return(r, g, b, 1.0)
-
+    return (1.0, 0.5 + 0.5 * x, 0.3 + 0.7 * x, 1.0)
 
 # ============================================================
 # 4. Scenarios
 # ============================================================
 
 def make_star(pos, vel, mass, name, axial_tilt=0.0, rot_speed=0.5):
-    L = star_luminosity(mass)
-    T = star_temperature(mass)
-    color = temp_to_color(T)
-
-    # GL radius scaled by luminosity
-    #radius = Body().radius
-
-    return Body(
-        pos=pos,
-        vel=vel,
-        mass=mass,
-        color=color,
-        name=name,
-        is_star=True,
-        #radius=radius,
-        rot_speed=rot_speed,
-        axial_tilt=axial_tilt
-    )
-
+    color = temp_to_color(star_temperature(mass))
+    return Body(pos=pos, vel=vel, mass=mass, color=color, name=name,
+                is_star=True, rot_speed=rot_speed, axial_tilt=axial_tilt)
 
 def scenario_solar_system() -> list[Body]:
-    sun = make_star(np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0]),
+    sun = make_star(np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]),
                     M_SUN, "Sun", axial_tilt=7.25, rot_speed=0.5)
 
-    def make_planet(a_au, e, inc_deg, mass, color, name, radius_km):
+    def make_planet(a_au, e, inc_deg, mass, color, name, radius_km, has_rings=False):
         a   = a_au * AU
         inc = math.radians(inc_deg)
-        pos, vel = kepler_to_cartesian(a, e, M_SUN, inc=inc)
+        p, v = kepler_to_cartesian(a, e, M_SUN, inc=inc)
         r = (radius_km / 70000) * 0.04
-        return Body(pos, vel, mass, color=color, name=name, radius=r)
+        return Body(p, v, mass, color=color, name=name, radius=r, has_rings=has_rings)
 
     return [
         sun,
-        #                  a(AU)   e      inc(°)
-        make_planet(  0.387, 0.206,  7.0,  3.30e23, ORANGE, "Mercury", 2440),
-        make_planet(  0.723, 0.007,  3.4,  4.87e24, TAN,    "Venus",   6052),
-        make_planet(  1.000, 0.017,  0.0,  5.97e24, BLUE,   "Earth",   6371),
-        make_planet(  1.524, 0.093,  1.9,  6.39e23, RED,    "Mars",    3390),
-        make_planet(  5.204, 0.049,  1.3,  1.90e27, BUFF,   "Jupiter", 69911),
-        make_planet(  9.582, 0.057,  2.5,  5.68e26, CREAM,  "Saturn",  58232),
+        make_planet(0.387, 0.206,  7.0, 3.30e23, ORANGE, "Mercury", 2440),
+        make_planet(0.723, 0.007,  3.4, 4.87e24, TAN,    "Venus",   6052),
+        make_planet(1.000, 0.017,  0.0, 5.97e24, BLUE,   "Earth",   6371),
+        make_planet(1.524, 0.093,  1.9, 6.39e23, RED,    "Mars",    3390),
+        make_planet(5.204, 0.049,  1.3, 1.90e27, BUFF,   "Jupiter", 69911),
+        make_planet(9.582, 0.057,  2.5, 5.68e26, CREAM,  "Saturn",  58232, has_rings=True),
     ]
-
 
 def scenario_binary_stars() -> list[Body]:
     dist = 1 * AU
     M = 2e30
     v = math.sqrt(G * M / 4 / dist)
-
-    starA = make_star(np.array([ dist,0,0]), np.array([0,0, v]), M, "Star A")
-    starB = make_star(np.array([-dist,0,0]), np.array([0,0,-v]), M, "Star B")
-
-    return [starA, starB]
-
-
+    return [
+        make_star(np.array([ dist,0,0]), np.array([0,0, v]), M, "Star A"),
+        make_star(np.array([-dist,0,0]), np.array([0,0,-v]), M, "Star B"),
+    ]
 
 def scenario_figure_eight() -> list[Body]:
-    M = 1.0e30
-    L = 0.5 * AU
+    M  = 1.0e30
+    L  = 0.5 * AU
     v0 = math.sqrt(G * M / L)
-
     px, pz = 0.97000436 * L, 0.24308753 * L
     vx, vz = 0.46620368 * v0, 0.43236573 * v0
-
-    A = make_star(np.array([-px,0,pz]), np.array([vx,0,vz]), M, "Body A")
-    B = make_star(np.array([ px,0,-pz]), np.array([vx,0,vz]), M, "Body B")
-    C = make_star(np.array([0,0,0]),     np.array([-2*vx,0,-2*vz]), M, "Body C")
-
-    return [A, B, C]
-
+    return [
+        make_star(np.array([-px,0, pz]), np.array([ vx,0, vz]), M, "Body A"),
+        make_star(np.array([ px,0,-pz]), np.array([ vx,0, vz]), M, "Body B"),
+        make_star(np.array([  0,0,  0]), np.array([-2*vx,0,-2*vz]), M, "Body C"),
+    ]
 
 def scenario_star_system() -> list[Body]:
     dist = 0.5 * AU
     M = 2e30
     v = math.sqrt(G * M / dist)
-
-    A = make_star(np.array([ dist,0,0]), np.array([0,0, v]), M, "Star A")
-    B = make_star(np.array([-dist,0,0]), np.array([0,0,-v]), M, "Star B")
-
-    return [A, B]
-
+    return [
+        make_star(np.array([ dist,0,0]), np.array([0,0, v]), M, "Star A"),
+        make_star(np.array([-dist,0,0]), np.array([0,0,-v]), M, "Star B"),
+    ]
 
 def scenario_RexPrime() -> list[Body]:
-    M_A = 1.1 * M_SUN
-    M_B = 0.9 * M_SUN
-    M_tot = M_A + M_B
-
+    M_A = 1.1 * M_SUN; M_B = 0.9 * M_SUN; M_tot = M_A + M_B
     a_bin = 3.5 * AU
-    r_A = a_bin * (M_B / M_tot)
-    r_B = a_bin * (M_A / M_tot)
-
+    r_A = a_bin * (M_B / M_tot); r_B = a_bin * (M_A / M_tot)
     omega = math.sqrt(G * M_tot / (a_bin ** 3))
-
-    vA = omega * r_A
-    vB = omega * r_B
-
-    starA = make_star(np.array([+r_A,0,0]), np.array([0,0,+vA]), M_A, "Rex Star A")
-    starB = make_star(np.array([-r_B,0,0]), np.array([0,0,-vB]), M_B, "Rex Star B")
-
+    starA = make_star(np.array([+r_A,0,0]), np.array([0,0,+omega*r_A]), M_A, "Rex Star A")
+    starB = make_star(np.array([-r_B,0,0]), np.array([0,0,-omega*r_B]), M_B, "Rex Star B")
     def R(km): return (km / 70000) * 0.04
-
-    # Planets
-    r_PA1 = 0.35 * AU
-    r_PA2 = 0.65 * AU
-    r_PB1 = 0.30 * AU
-
-    pA1 = Body(starA.pos + np.array([r_PA1,0,0]),
-               starA.vel + np.array([0,0,math.sqrt(G*M_A/r_PA1)]),
-               5.97e24, color=GREEN, name="Rex Prime", radius=R(6371))
-
-    pA2 = Body(starA.pos + np.array([r_PA2,0,0]),
-               starA.vel + np.array([0,0,math.sqrt(G*M_A/r_PA2)]),
-               4.87e24, color=BLUE, name="Rex Minor", radius=R(6052))
-
-    pB1 = Body(starB.pos + np.array([r_PB1,0,0]),
-               starB.vel + np.array([0,0,-math.sqrt(G*M_B/r_PB1)]),
-               6.39e23, color=CYAN, name="Rex Ember", radius=R(3390))
-
-    # Circumbinary
-    r_CB1 = 12 * AU
-    r_CB2 = 16 * AU
-
-    cb1 = Body(np.array([r_CB1,0,0]), np.array([0,0,math.sqrt(G*M_tot/r_CB1)]),
-               5e24, color=CREAM, name="Rex Outer I", radius=R(7000))
-
-    cb2 = Body(np.array([-r_CB2,0,0]), np.array([0,0,-0.85*math.sqrt(G*M_tot/r_CB2)]),
-               5e24, color=RED, name="Rex Outer II", radius=R(7000))
-
+    pA1 = Body(starA.pos+np.array([0.35*AU,0,0]), starA.vel+np.array([0,0,math.sqrt(G*M_A/(0.35*AU))]),
+               5.97e24, color=GREEN, name="Rex Prime",   radius=R(6371))
+    pA2 = Body(starA.pos+np.array([0.65*AU,0,0]), starA.vel+np.array([0,0,math.sqrt(G*M_A/(0.65*AU))]),
+               4.87e24, color=BLUE,  name="Rex Minor",   radius=R(6052))
+    pB1 = Body(starB.pos+np.array([0.30*AU,0,0]), starB.vel+np.array([0,0,-math.sqrt(G*M_B/(0.30*AU))]),
+               6.39e23, color=CYAN,  name="Rex Ember",   radius=R(3390))
+    cb1 = Body(np.array([12*AU,0,0]), np.array([0,0, math.sqrt(G*M_tot/(12*AU))]),
+               5e24, color=CREAM, name="Rex Outer I",  radius=R(7000), has_rings=True)
+    cb2 = Body(np.array([-16*AU,0,0]), np.array([0,0,-0.85*math.sqrt(G*M_tot/(16*AU))]),
+               5e24, color=RED,   name="Rex Outer II", radius=R(7000))
     return [starA, starB, pA1, pA2, pB1, cb1, cb2]
-
 
 def myBigGapingBlackHole() -> list[Body]:
     BH_mass = 30 * M_SUN
-    # Schwarzschild radius = 2GM/c^2
-    Rs = 2 * G * BH_mass / (3e8**2)
-    Rs_km = Rs / 1000
-
     def R(km): return (km / 70000) * 0.04
-
     return [
         Body(np.array([0,0,0]), np.array([0,0,0]), BH_mass,
              color=GREEN, name="Blacky", is_star=True, radius=1.0),
-
         Body(np.array([5*AU,0,0]), np.array([0,0,14000]), 2e24,
              color=BLUE, name="Planety", radius=R(6000)),
     ]
 
 def scenario_chaos_cluster() -> list[Body]:
-    bodies = []
-
-    star_mass = 0.8 * M_SUN
-    bodies.append(
-        Body(np.array([0,0,0]), np.array([0,0,0]), star_mass,
-             color=YELLOW, name="Cluster Star", is_star=True, radius=0.2)
-    )
-
+    bodies = [Body(np.array([0,0,0]), np.array([0,0,0]), 0.8*M_SUN,
+                   color=YELLOW, name="Cluster Star", is_star=True, radius=0.2)]
     rng = np.random.default_rng()
-    def R_from_mass(m): return 0.01 + 0.02 * (m / 5e24)
-
     for i in range(12):
-        pos = rng.uniform(-0.8*AU, 0.8*AU, size=3)
-        vel = rng.uniform(-5000, 5000, size=3)
-        mass = rng.uniform(1e22, 5e24)
-        color = (rng.uniform(0.2,1.0), rng.uniform(0.2,1.0), rng.uniform(0.2,1.0), 1.0)
-
-        bodies.append(
-            Body(pos, vel, mass, color=color,
-                 name=f"Astro-{i+1}", radius=R_from_mass(mass))
-        )
-
+        m = rng.uniform(1e22, 5e24)
+        bodies.append(Body(
+            rng.uniform(-0.8*AU, 0.8*AU, size=3),
+            rng.uniform(-5000, 5000, size=3), m,
+            color=(rng.uniform(0.2,1.0), rng.uniform(0.2,1.0), rng.uniform(0.2,1.0), 1.0),
+            name=f"Astro-{i+1}", radius=0.01 + 0.02*(m/5e24)))
     return bodies
 
-
-
-
 SCENARIOS = {
-    "1": ("Solar System", scenario_solar_system),
-    "2": ("Binary Stars", scenario_binary_stars),
-    "3": ("Figure Eight", scenario_figure_eight),
-    "4": ("Star System",  scenario_star_system),
-    "5": ("Rex Prime",    scenario_RexPrime),
-    "6": ("Black Hole - Test", myBigGapingBlackHole),
-    "7": ("Chaos Cluster - Merge Test", scenario_chaos_cluster)
+    "1": ("Solar System",            scenario_solar_system),
+    "2": ("Binary Stars",            scenario_binary_stars),
+    "3": ("Figure Eight",            scenario_figure_eight),
+    "4": ("Star System",             scenario_star_system),
+    "5": ("Rex Prime",               scenario_RexPrime),
+    "6": ("Black Hole - Test",       myBigGapingBlackHole),
+    "7": ("Chaos Cluster",           scenario_chaos_cluster),
 }
 
 # ============================================================
@@ -533,7 +397,6 @@ class OverlayRenderer:
         in vec2 uv; out vec4 f_color; uniform sampler2D tex;
         void main() { f_color = texture(tex, uv); }
     '''
-
     def __init__(self, ctx, win_w, win_h):
         self.ctx, self.win_w, self.win_h = ctx, win_w, win_h
         self.prog = ctx.program(vertex_shader=self._VERT, fragment_shader=self._FRAG)
@@ -544,7 +407,7 @@ class OverlayRenderer:
         return (x / self.win_w) * 2 - 1, 1 - (y / self.win_h) * 2
 
     def draw(self, img: Image.Image, x: int, y: int):
-        w, h   = img.size
+        w, h = img.size
         x0, y0 = self._ndc(x, y)
         x1, y1 = self._ndc(x + w, y + h)
         self.vbo.write(np.array([
@@ -674,13 +537,24 @@ uniform bool  is_star;
 uniform vec3  eye_pos;
 uniform vec3  light_pos[{MAX_LIGHTS}];
 uniform int   num_lights;
+uniform float time;
 out vec4 f_color;
+
+float hash(vec3 p) {{
+    p = fract(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}}
+
 void main() {{
     vec3 rgb = body_color.rgb;
     if (is_star) {{
         vec3  V    = normalize(eye_pos - frag_pos);
         float limb = mix(0.72, 1.0, clamp(dot(frag_normal, V), 0.0, 1.0));
-        f_color = vec4(rgb * limb, 1.0);
+        // Subtle animated surface variation
+        float n = hash(frag_normal * 8.0 + vec3(time * 0.05));
+        n = mix(0.90, 1.0, n);
+        f_color = vec4(rgb * limb * n, 1.0);
     }} else {{
         vec3  V = normalize(eye_pos - frag_pos);
         vec3  N = frag_normal;
@@ -697,10 +571,12 @@ void main() {{
         }}
         diffuse  = min(diffuse,  1.0);
         specular = min(specular, 0.7);
-        float rim = pow(1.0 - max(dot(N, V), 0.0), 2.5) * 0.55;
+        // Enhanced atmospheric rim glow
+        float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.8;
+        vec3 atmo = rgb * 0.4 + vec3(0.1, 0.3, 0.5) * 0.6;
         vec3 lit = rgb * (AMBIENT + (1.0 - AMBIENT) * diffuse)
                  + vec3(0.85, 0.92, 1.0) * specular * 0.45
-                 + rgb * rim;
+                 + atmo * rim;
         f_color = vec4(clamp(lit, 0.0, 1.0), 1.0);
     }}
 }}
@@ -711,15 +587,70 @@ _GRID_VERT = '''
 in vec3 in_pos;
 uniform mat4 projection;
 uniform mat4 view;
-void main() {{ gl_Position = projection * view * vec4(in_pos, 1.0); }}
+void main() { gl_Position = projection * view * vec4(in_pos, 1.0); }
 '''
 _GRID_FRAG = '''
 #version 330
 out vec4 f_color;
 uniform vec4 color;
-void main() {{ f_color = color; }}
+void main() { f_color = color; }
 '''
 
+# ── Fading trail shader ──────────────────────────────────────
+_TRAIL_VERT = '''
+#version 330
+in vec3 in_pos;
+in vec4 in_color;
+out vec4 v_color;
+void main() {
+    v_color     = in_color;
+    gl_Position = vec4(in_pos, 1.0);  // pass raw world pos to geometry stage
+}
+'''
+
+_TRAIL_GEOM = '''
+#version 330
+layout(lines) in;
+layout(triangle_strip, max_vertices = 4) out;
+in  vec4 v_color[];
+out vec4 g_color;
+uniform mat4 projection;
+uniform mat4 view;
+uniform float line_width;
+uniform vec2  viewport;
+
+void main() {
+    vec4 p0 = projection * view * gl_in[0].gl_Position;
+    vec4 p1 = projection * view * gl_in[1].gl_Position;
+
+    // NDC
+    vec2 n0 = p0.xy / p0.w;
+    vec2 n1 = p1.xy / p1.w;
+
+    // Screen-space direction and perpendicular
+    vec2 dir   = normalize((n1 - n0) * viewport);
+    vec2 perp  = vec2(-dir.y, dir.x) * (line_width / viewport);
+
+    g_color = v_color[0];
+    gl_Position = vec4((n0 - perp) * p0.w, p0.z, p0.w); EmitVertex();
+    gl_Position = vec4((n0 + perp) * p0.w, p0.z, p0.w); EmitVertex();
+
+    g_color = v_color[1];
+    gl_Position = vec4((n1 - perp) * p1.w, p1.z, p1.w); EmitVertex();
+    gl_Position = vec4((n1 + perp) * p1.w, p1.z, p1.w); EmitVertex();
+
+    EndPrimitive();
+}
+'''
+
+_TRAIL_FRAG = '''
+#version 330
+in  vec4 g_color;
+out vec4 f_color;
+void main() { f_color = g_color; }
+'''
+
+# ── Star glow shader ─────────────────────────────────────────
 _GLOW_VERT = '''
 #version 330
 in vec2 in_corner;
@@ -750,6 +681,65 @@ void main() {
 }
 '''
 
+# ── Starfield shader ─────────────────────────────────────────
+_STAR_VERT = '''
+#version 330
+in vec3 in_pos;
+in float in_brightness;
+uniform mat4 projection;
+uniform mat4 view;
+out float brightness;
+void main() {
+    brightness  = in_brightness;
+    gl_Position = projection * view * vec4(in_pos, 1.0);
+    gl_PointSize = 2.0;
+}
+'''
+_STAR_FRAG = '''
+#version 330
+in  float brightness;
+out vec4  f_color;
+void main() {
+    float d = length(gl_PointCoord - vec2(0.5));
+    if (d > 0.5) discard;
+    float a = smoothstep(0.5, 0.1, d) * brightness;
+    f_color = vec4(vec3(brightness), a);
+}
+'''
+
+# ── Ring shader ───────────────────────────────────────────────
+_RING_VERT = '''
+#version 330
+in vec3 in_pos;
+uniform mat4 projection;
+uniform mat4 view;
+uniform mat4 model;
+out vec3 frag_pos_local;
+void main() {
+    frag_pos_local = in_pos;
+    gl_Position = projection * view * model * vec4(in_pos, 1.0);
+}
+'''
+_RING_FRAG = '''
+#version 330
+in  vec3 frag_pos_local;
+out vec4 f_color;
+uniform float inner_r;
+uniform float outer_r;
+void main() {
+    float d = length(frag_pos_local.xz);
+    float t = (d - inner_r) / (outer_r - inner_r);
+    if (t < 0.0 || t > 1.0) discard;
+    float alpha = sin(t * 3.14159) * 0.60;
+    // Banded ring color: warm tan with subtle variation
+    float band = fract(t * 6.0);
+    vec3 col_a = vec3(0.78, 0.68, 0.50);
+    vec3 col_b = vec3(0.58, 0.50, 0.38);
+    vec3 color = mix(col_a, col_b, smoothstep(0.3, 0.7, band));
+    f_color = vec4(color, alpha);
+}
+'''
+
 # ============================================================
 # 8. Main Window
 # ============================================================
@@ -770,6 +760,7 @@ class GravitySim(mglw.WindowConfig):
         self.tracking_index   = None
         self.selected_index   = None
         self.sim_elapsed_days = 0.0
+        self._trail_tick      = 0
 
         self.camera_target = np.array([0.0, 0.0, 0.0], dtype='f4')
         self.camera_yaw    = -math.pi / 2
@@ -779,7 +770,7 @@ class GravitySim(mglw.WindowConfig):
 
         self.physics = PhysicsEngine([])
 
-        # Sphere
+        # ── Sphere ────────────────────────────────────────────
         self.sphere_prog = self.ctx.program(
             vertex_shader=_SPHERE_VERT, fragment_shader=_SPHERE_FRAG)
         vbo = self.ctx.buffer(SPHERE_VERTS)
@@ -787,19 +778,53 @@ class GravitySim(mglw.WindowConfig):
         self.sphere_vao = self.ctx.vertex_array(
             self.sphere_prog, [(vbo, '3f 3f', 'in_pos', 'in_normal')], ibo)
 
-        # Grid
+        # ── Grid ──────────────────────────────────────────────
         self.grid_prog = self.ctx.program(
             vertex_shader=_GRID_VERT, fragment_shader=_GRID_FRAG)
         self._init_grid(GRID_SIZE, GRID_DIVISIONS)
 
-        # Star glow
+        # ── Fading trail ──────────────────────────────────────
+        self.trail_prog = self.ctx.program(
+            vertex_shader=_TRAIL_VERT, fragment_shader=_TRAIL_FRAG, geometry_shader=_TRAIL_GEOM)
+
+        # ── Star glow ─────────────────────────────────────────
         self.glow_prog = self.ctx.program(
             vertex_shader=_GLOW_VERT, fragment_shader=_GLOW_FRAG)
         quad = np.array([-1,-1, 1,-1, -1,1, 1,-1, 1,1, -1,1], dtype='f4')
         self.glow_vao = self.ctx.simple_vertex_array(
             self.glow_prog, self.ctx.buffer(quad), 'in_corner')
 
-        # 2-D overlay
+        # ── Starfield ─────────────────────────────────────────
+        self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+        self.star_prog = self.ctx.program(
+            vertex_shader=_STAR_VERT, fragment_shader=_STAR_FRAG)
+        rng = np.random.default_rng(42)
+        N   = 4000
+        phi   = np.arccos(rng.uniform(-1, 1, N))
+        theta = rng.uniform(0, 2*math.pi, N)
+        R_sky = 800.0
+        star_verts = np.column_stack([
+            R_sky * np.sin(phi) * np.cos(theta),
+            R_sky * np.sin(phi) * np.sin(theta),
+            R_sky * np.cos(phi),
+            rng.uniform(0.3, 1.0, N),
+        ]).astype('f4')
+        self.starfield_vbo = self.ctx.buffer(star_verts)
+        self.starfield_vao = self.ctx.vertex_array(
+            self.star_prog,
+            [(self.starfield_vbo, '3f 1f', 'in_pos', 'in_brightness')])
+
+        # ── Rings ─────────────────────────────────────────────
+        self.ring_prog = self.ctx.program(
+            vertex_shader=_RING_VERT, fragment_shader=_RING_FRAG)
+        ring_vbo = self.ctx.buffer(RING_VERTS)
+        ring_ibo = self.ctx.buffer(RING_INDICES)
+        self.ring_vao = self.ctx.vertex_array(
+            self.ring_prog, [(ring_vbo, '3f', 'in_pos')], ring_ibo)
+        self.ring_prog['inner_r'].value = 1.45
+        self.ring_prog['outer_r'].value = 2.35
+
+        # ── 2-D overlay ───────────────────────────────────────
         self.overlay = OverlayRenderer(self.ctx, WIDTH, HEIGHT)
 
         self.load_scenario("1")
@@ -807,28 +832,26 @@ class GravitySim(mglw.WindowConfig):
 
     # ------------------------------------------------------------------
     def validate_indices(self):
-        # selected
         if self.selected_index is not None:
             if self.selected_index >= len(self.physics.bodies):
                 self.selected_index = None
-
-        # tracking
         if self.tracking_index is not None:
             if self.tracking_index >= len(self.physics.bodies):
                 self.tracking_index = None
+
     # ------------------------------------------------------------------
     def _init_grid(self, size, divisions):
-        n    = divisions + 1
-        pts  = np.linspace(-size, size, n, dtype='f4')
+        n   = divisions + 1
+        pts = np.linspace(-size, size, n, dtype='f4')
         XX, ZZ = np.meshgrid(pts, pts)
         self.grid_xz = np.column_stack([XX.ravel(), ZZ.ravel()])
         indices = []
         for iz in range(n):
             for ix in range(n - 1):
-                indices.append(iz * n + ix);  indices.append(iz * n + ix + 1)
+                indices += [iz*n+ix, iz*n+ix+1]
         for ix in range(n):
             for iz in range(n - 1):
-                indices.append(iz * n + ix);  indices.append((iz + 1) * n + ix)
+                indices += [iz*n+ix, (iz+1)*n+ix]
         self.grid_line_indices = np.array(indices, dtype='i4')
         self.grid_vbo = self.ctx.buffer(reserve=len(self.grid_line_indices) * 3 * 4)
         self.grid_vao = self.ctx.simple_vertex_array(self.grid_prog, self.grid_vbo, 'in_pos')
@@ -840,9 +863,8 @@ class GravitySim(mglw.WindowConfig):
             bx, _, bz = (body.pos / SCALE)
             dx   = xz[:, 0] - float(bx)
             dz   = xz[:, 1] - float(bz)
-            dist = np.sqrt(dx * dx + dz * dz + WELL_SOFTENING ** 2)
+            dist = np.sqrt(dx*dx + dz*dz + WELL_SOFTENING**2)
             y   -= WELL_SCALE * (body.mass / M_SUN) / dist
-        #y = np.clip(y, -WELL_SCALE * 20.0, 0.0)
         xyz = np.column_stack([xz[:, 0], y, xz[:, 1]]).astype('f4')
         self.grid_vbo.write(np.ascontiguousarray(xyz[self.grid_line_indices]))
 
@@ -865,6 +887,7 @@ class GravitySim(mglw.WindowConfig):
         print("  F              Focus / unfocus selected body")
         print("  T              Cycle camera tracking")
         print("  R              Reset camera")
+        print("  B              Toggle barycentric camera")
         for k, (name, _) in SCENARIOS.items():
             print(f"  {k}              Load: {name}")
         print("=" * 52)
@@ -885,12 +908,11 @@ class GravitySim(mglw.WindowConfig):
     def _get_matrices(self):
         if self.use_barycentric_camera and self.tracking_index is None:
             self.camera_target = self._barycenter().astype('f4')
-
         x = self.camera_radius * math.cos(self.camera_pitch) * math.cos(self.camera_yaw)
         y = self.camera_radius * math.sin(self.camera_pitch)
         z = self.camera_radius * math.cos(self.camera_pitch) * math.sin(self.camera_yaw)
         eye  = np.array([x, y, z], dtype='f4') + self.camera_target
-        view = matrix44.create_look_at(eye, self.camera_target, [0, 1, 0], dtype='f4')
+        view = matrix44.create_look_at(eye, self.camera_target, [0,1,0], dtype='f4')
         proj = matrix44.create_perspective_projection(
             45.0, self.wnd.aspect_ratio, 0.001, 2000.0, dtype='f4')
         return proj, view, eye
@@ -914,14 +936,14 @@ class GravitySim(mglw.WindowConfig):
         if abs(clip[3]) < 1e-6: return None
         ndc = clip[:3] / clip[3]
         if not (-1.1 <= ndc[0] <= 1.1 and -1.1 <= ndc[1] <= 1.1 and ndc[2] > 0): return None
-        return (ndc[0] + 1) * 0.5 * WIDTH, (1 - ndc[1]) * 0.5 * HEIGHT
+        return (ndc[0]+1)*0.5*WIDTH, (1-ndc[1])*0.5*HEIGHT
 
     def _pick_body(self, mx, my, proj, view):
         best_idx, best_dist = None, PICK_THRESHOLD_PX
         for i, body in enumerate(self.physics.bodies):
             sc = self._world_to_screen((body.pos / SCALE).astype('f4'), proj, view)
             if sc is None: continue
-            d = math.hypot(sc[0] - mx, sc[1] - my)
+            d = math.hypot(sc[0]-mx, sc[1]-my)
             if d < best_dist: best_dist, best_idx = d, i
         return best_idx
 
@@ -934,6 +956,13 @@ class GravitySim(mglw.WindowConfig):
     def _unfocus(self):
         self.tracking_index = None
         print("Focus released")
+
+    def _barycenter(self):
+        if not self.physics.bodies:
+            return np.zeros(3, dtype='f4')
+        M   = sum(b.mass for b in self.physics.bodies)
+        com = sum(b.mass * b.pos for b in self.physics.bodies) / M
+        return (com / SCALE).astype('f4')
 
     # ------------------------------------------------------------------
     def on_key_event(self, key, action, modifiers):
@@ -951,7 +980,7 @@ class GravitySim(mglw.WindowConfig):
         if key == K.Q: self.camera_radius = max(0.1, self.camera_radius * 0.5)
         if key == K.E: self.camera_radius = min(500.0, self.camera_radius / 0.5)
         if key == K.R:
-            self.camera_target  = np.array([0.0, 0.0, 0.0], dtype='f4')
+            self.camera_target  = np.array([0.0,0.0,0.0], dtype='f4')
             self.camera_radius  = 5.0
             self.tracking_index = None
         if key == K.T:
@@ -971,7 +1000,6 @@ class GravitySim(mglw.WindowConfig):
             self.use_barycentric_camera = not self.use_barycentric_camera
             print("Barycentric camera:", self.use_barycentric_camera)
 
-
     def on_mouse_press_event(self, x, y, button):
         if button != 1: return
         proj, view, _ = self._get_matrices()
@@ -989,31 +1017,36 @@ class GravitySim(mglw.WindowConfig):
     def _update_trail_gpu(self, body: Body):
         if len(body.trail) < 2: return
         trail_data = np.array(list(body.trail), dtype='f4')
-        needed = trail_data.nbytes
+        n = len(trail_data)
+        alphas = np.linspace(0.0, 1.65, n, dtype='f4')
+        r, g, b, _ = body.color
+        colors = np.column_stack([
+            np.full(n, r, dtype='f4'),
+            np.full(n, g, dtype='f4'),
+            np.full(n, b, dtype='f4'),
+            alphas,
+        ])
+        interleaved = np.hstack([trail_data, colors]).astype('f4')
+        needed = interleaved.nbytes
         if body.trail_vbo is None or body.trail_vbo.size != needed:
             body.release_gpu()
-            body.trail_vbo = self.ctx.buffer(trail_data)
-            body.trail_vao = self.ctx.simple_vertex_array(
-                self.grid_prog, body.trail_vbo, 'in_pos')
+            body.trail_vbo = self.ctx.buffer(interleaved)
+            body.trail_vao = self.ctx.vertex_array(
+                self.trail_prog,
+                [(body.trail_vbo, '3f 4f', 'in_pos', 'in_color')])
         else:
-            body.trail_vbo.write(trail_data)
+            body.trail_vbo.write(interleaved)
 
     def _append_trail(self, body: Body, gl_pos: np.ndarray):
-        """
-        Append a trail point only if the jump from the last recorded point
-        is within TRAIL_MAX_JUMP. If the body has teleported (ejection artefact),
-        clear and restart the trail instead of drawing a wild line across the screen.
-        """
         if body.trail:
-            last = body.trail[-1]
-            jump = float(np.linalg.norm(gl_pos - last))
+            jump = float(np.linalg.norm(gl_pos - body.trail[-1]))
             if jump > TRAIL_MAX_JUMP:
                 body.clear_trail()
         body.trail.append(gl_pos.copy())
 
     # ------------------------------------------------------------------
     def _draw_sphere(self, gl_pos, radius, rotation, axial_tilt,
-                     color, is_star, eye, light_positions):
+                     color, is_star, eye, light_positions, time):
         model      = self._model_matrix(gl_pos, radius, rotation, axial_tilt)
         normal_mat = self._normal_matrix(model)
         self.sphere_prog['model'].write(model)
@@ -1021,6 +1054,7 @@ class GravitySim(mglw.WindowConfig):
         self.sphere_prog['body_color'].value = color
         self.sphere_prog['is_star'].value    = is_star
         self.sphere_prog['eye_pos'].value    = tuple(eye)
+        self.sphere_prog['time'].value       = time
         n_lights = min(len(light_positions), MAX_LIGHTS)
         self.sphere_prog['num_lights'].value = n_lights
         padded = np.zeros((MAX_LIGHTS, 3), dtype='f4')
@@ -1029,25 +1063,34 @@ class GravitySim(mglw.WindowConfig):
         self.sphere_prog['light_pos'].write(np.ascontiguousarray(padded))
         self.sphere_vao.render(moderngl.TRIANGLES)
 
+    def _draw_rings(self, gl_pos, radius, rotation, proj, view):
+        """Draw Saturn-style rings around a body."""
+        # Rings sit in the XZ plane, scaled by body radius, slightly tilted for looks
+        tilt = math.radians(27.0)  # Saturn's ring tilt
+        T  = matrix44.create_from_translation(gl_pos.astype('f4'), dtype='f4')
+        Rx = matrix44.create_from_x_rotation(tilt, dtype='f4')
+        Ry = matrix44.create_from_y_rotation(rotation * 0.3, dtype='f4')
+        S  = matrix44.create_from_scale([radius]*3, dtype='f4')
+        model = S @ Rx @ Ry @ T
+        self.ring_prog['projection'].write(proj)
+        self.ring_prog['view'].write(view)
+        self.ring_prog['model'].write(model)
+        self.ctx.disable(moderngl.CULL_FACE)
+        self.ring_vao.render(moderngl.TRIANGLES)
+
     # ----------------------------------------------------------------
     def on_render(self, time: float, frametime: float):
         self.ctx.clear(*BG_COLOR)
 
         if not self.is_paused:
-            # 1. Define dt
             dt = SIM_SPEED * self.time_step_multi
-            
-            # 2. Update Physics
             self.physics.step(dt)
             self.validate_indices()
             self.sim_elapsed_days += dt / DAY
 
-            # 3. Check collisions using that same dt
-            self.physics.handle_collisions(dt)
-
         if self.tracking_index is not None and \
            self.tracking_index < len(self.physics.bodies):
-            b         = self.physics.bodies[self.tracking_index]
+            b = self.physics.bodies[self.tracking_index]
             target_gl = (b.pos / SCALE).astype('f4')
             self.camera_target += (target_gl - self.camera_target) * 0.12
 
@@ -1057,6 +1100,12 @@ class GravitySim(mglw.WindowConfig):
             (b.pos / SCALE).astype('f4')
             for b in self.physics.bodies if b.is_star
         ]
+
+        # ── Starfield (drawn first, no depth write) ───────────────────
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self.star_prog['projection'].write(proj)
+        self.star_prog['view'].write(view)
+        self.starfield_vao.render(moderngl.POINTS)
 
         # ── 3-D scene ─────────────────────────────────────────────────
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -1069,48 +1118,62 @@ class GravitySim(mglw.WindowConfig):
         self.grid_prog['color'].value = GRID_COLOR
         self.grid_vao.render(moderngl.LINES)
 
-        # Trails
+        # ── Fading trails ─────────────────────────────────────────────    
+        self.trail_prog['projection'].write(proj)
+        self.trail_prog['view'].write(view)
+        self.trail_prog['line_width'].value  = TRAIL_WIDTH
+        self.trail_prog['viewport'].value    = (float(WIDTH), float(HEIGHT))
+
+        self.ctx.depth_mask = False          # ← read depth but don't write it
+
         for body in self.physics.bodies:
             gl_pos = (body.pos / SCALE).astype('f4')
-            self._append_trail(body, gl_pos)
+            self._trail_tick += 1
+            if self._trail_tick % 3 == 0:
+                self._append_trail(body, gl_pos)
             self._update_trail_gpu(body)
             if body.trail_vao:
-                r, g, b_c, _ = body.color
-                self.grid_prog['color'].value = (r, g, b_c, 0.35)
                 body.trail_vao.render(moderngl.LINE_STRIP)
 
-        # Star glows
+        self.ctx.depth_mask = True           # ← restore for spheres/rings
+        # ── Star glows ────────────────────────────────────────────────
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE
         self.ctx.disable(moderngl.DEPTH_TEST)
         self.glow_prog['projection'].write(proj)
         self.glow_prog['view'].write(view)
         for body in self.physics.bodies:
-            if body.is_star:
-                L = star_luminosity(body.mass)
-                glow_size = body.radius * (1.0 + L ** 0.25)
+            if not body.is_star: continue
             gl_pos = (body.pos / SCALE).astype('f4')
-            self.glow_prog['star_pos'].value  = tuple(gl_pos)
-            self.glow_prog['glow_size'].value = body.radius * 5.5
+            self.glow_prog['star_pos'].value   = tuple(gl_pos)
+            self.glow_prog['glow_size'].value  = body.radius * 5.5
             r, g, b_c, _ = body.color
             self.glow_prog['glow_color'].value = (r, g, b_c, 1.0)
             self.glow_vao.render(moderngl.TRIANGLES)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         self.ctx.enable(moderngl.DEPTH_TEST)
 
-        # Spheres
+        # ── Spheres ───────────────────────────────────────────────────
         for i, body in enumerate(self.physics.bodies):
             gl_pos = (body.pos / SCALE).astype('f4')
             if i == self.selected_index:
                 self.ctx.enable(moderngl.CULL_FACE)
                 self.ctx.cull_face = 'front'
                 self._draw_sphere(gl_pos, body.radius * 1.09, body.rotation,
-                                  body.axial_tilt, (1.0, 1.0, 1.0, 1.0),
-                                  True, eye, light_positions)
+                                  body.axial_tilt, (1.0,1.0,1.0,1.0),
+                                  True, eye, light_positions, time)
                 self.ctx.cull_face = 'back'
                 self.ctx.disable(moderngl.CULL_FACE)
             self._draw_sphere(gl_pos, body.radius, body.rotation,
                               body.axial_tilt, body.color, body.is_star,
-                              eye, light_positions)
+                              eye, light_positions, time)
+
+        # ── Rings (drawn after spheres, alpha blended) ────────────────
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        self.ctx.disable(moderngl.CULL_FACE)
+        for body in self.physics.bodies:
+            if not body.has_rings: continue
+            gl_pos = (body.pos / SCALE).astype('f4')
+            self._draw_rings(gl_pos, body.radius, body.rotation, proj, view)
 
         # ── 2-D overlay ───────────────────────────────────────────────
         self.ctx.disable(moderngl.DEPTH_TEST)
@@ -1133,31 +1196,6 @@ class GravitySim(mglw.WindowConfig):
                 HEIGHT - hint.height - PANEL_MARGIN)
         self.ctx.enable(moderngl.DEPTH_TEST)
 
-    # ── Camera Shizz ───────────────────────────────────────────────
-    def _barycenter(self):
-        if not self.physics.bodies:
-            return np.zeros(3, dtype='f4')
-        M = sum(b.mass for b in self.physics.bodies)
-
-
-
 # ============================================================
 if __name__ == '__main__':
     mglw.run_window_config(GravitySim)
-
-
-
-"""
-def total_energy(self):
-    K = 0.0
-    U = 0.0
-    for i in bi in enumerate(self.bodies):
-        K += 0.5 bi.mass * np.dot(bi.vel, bi.vel)
-        for j in range(i + 1, len(self.bodies)):
-            bj = self.bodies[j]
-            r = np.linalg.norm[bi.pos - bj.pos]
-            if r > 0:
-                U -= G * bi.mass * bj.mass / r
-    return K + U
-
-"""
